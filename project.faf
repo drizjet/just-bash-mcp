@@ -1,0 +1,104 @@
+version: 2.5
+project:
+  name: just-bash-mcp
+  goal: Sandboxed bash execution for AI agents via Model Context Protocol
+  main_language: typescript
+  language: typescript
+  license: Apache-2.0
+  tags:
+    - mcp
+    - sandbox
+    - agent
+    - bash
+    - vercel
+    - just-bash
+stack:
+  runtime: node
+  framework: "@modelcontextprotocol/sdk"
+  core_dep: just-bash@^3.0.1
+  package_manager: npm
+  build: tsc
+  cicd: github-actions
+  language_version: ES2022
+  module_system: ESM
+  node_version: ">=18"
+  api_type: mcp-stdio
+  transport: stdio
+human_context:
+  who: badanalysis — solo dev, multi-harness agent stack
+  what: Sandboxed bash + faf tools MCP server for AI agent fleets
+  when: 2026 — deepseek-v4-flash-free era, multi-harness agent integration push
+  where: Windows 11, PowerShell 5.1, OpenCode + 14 other AI agent CLIs
+  why: Every agent runs its bash tool with full user privileges; just-bash provides a sandboxed alternative with virtual FS
+  how: Thin MCP wrapper over Vercel Labs' just-bash package; OverlayFs mounted at project root; per-session state
+domain:
+  role: Sandboxed shell execution service for the lains Tools agent fleet
+  architecture:
+    - Single MCP server with stdio transport
+    - One persistent Bash instance per MCP session (singleton)
+    - OverlayFs (copy-on-write) over the configured project root
+    - Optional allow-listed network for trusted APIs (off by default)
+    - "Execution limits: 30s timeout, 1MB output cap, 10k command max"
+  capabilities:
+    - Full bash + 100+ unix commands (cat, awk, sed, jq, sqlite3, xan, yq, tar, etc.)
+    - Optional python3 (CPython compiled to WASM) - opt-in via bash_exec config
+    - Optional js-exec (QuickJS) - opt-in
+    - "Path translation: /home/user/project/* <-> <project-root>/*"
+    - In-memory writes; real FS reads
+  security_model:
+    - Writes do NOT touch the real filesystem unless explicitly committed
+    - No VM isolation - TS-level sandbox, not OS-level
+    - Network disabled by default; allow-list via JUST_BASH_NETWORK_ALLOW env var
+    - Python/JS runtimes off by default (use just-bash's opt-in flags)
+    - Configurable execution limits prevent runaway scripts
+    - Path traversal blocked - sandbox paths must start with /home/user/project
+  configuration:
+    - "JUST_BASH_PROJECT_ROOT - project dir to mount (default: cwd)"
+    - JUST_BASH_NETWORK_ALLOW - comma-separated URL prefixes
+    - JUST_BASH_MAX_DURATION_MS - script timeout (default 30000)
+    - JUST_BASH_MAX_OUTPUT_BYTES - stdout cap (default 1048576)
+  conventions:
+    - Use bash_exec for all commands; never access real FS directly
+    - "Path translation: ask realpath to convert sandbox paths before reading"
+    - Reset sandbox when starting a new task to get a clean overlay
+    - Inspect with sandbox_status before long sessions
+  forbidden:
+    - Do NOT enable network without an explicit user-configured allow-list
+    - Do NOT enable python3 or js-exec in agent-facing configs without user review
+    - Do NOT commit overlay writes via any tool other than explicit user request
+    - Do NOT run with elevated privileges - the sandbox is the point
+    - Do NOT use this for personal/day-to-day shell (use PowerShell); this is for agent commands only
+integrations:
+  - system: opencode
+    config_path: ~/.config/opencode/mcp_servers.json
+    entry: node dist/index.js
+  - system: codex
+    config_path: ~/.codex/config.toml
+    format: toml
+  - system: claude
+    config_path: ~/.claude.json
+    format: json
+  - system: kiro
+    config_path: ~/.kiro/settings/mcp.json
+    format: json
+  - system: cursor
+    config_path: ~/.cursor/mcp.json
+    format: json
+_score_meta:
+  target_audience: "AI agents and developers integrating sandboxed bash via MCP"
+  stability: "beta"
+  api_compatibility: "MCP 2024-11-05"
+  tested_with:
+    - "opencode 1.17.7"
+    - "codex 0.140.0"
+    - "hermes-agent 0.16.0"
+    - "factory droid"
+  node_compatibility: ">=18.0.0"
+  last_audited: "2026-06-18"
+  audit_status: "GREEN"
+faf:
+  generated_by: faf init
+  generator_version: 6.13.0
+  moltbot_compatible: true
+faf_version: 2.5.0
+monorepo: {}

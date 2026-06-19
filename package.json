@@ -1,0 +1,38 @@
+{
+  "name": "just-bash-mcp",
+  "version": "0.1.0",
+  "description": "Sandboxed bash execution for AI agents via MCP, powered by Vercel's just-bash",
+  "type": "module",
+  "bin": {
+    "just-bash-mcp": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch",
+    "test": "node --test dist/__tests__/*.test.js",
+    "lint": "tsc --noEmit"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "bash",
+    "sandbox",
+    "agent",
+    "just-bash",
+    "vercel"
+  ],
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "just-bash": "^3.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
