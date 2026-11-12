@@ -4,7 +4,7 @@
 
 ## What this is
 
-A thin MCP (Model Context Protocol) server that wraps [Vercel Labs' `just-bash`](https://github.com/vercel-labs/just-bash) — a virtual bash environment in TypeScript with an in-memory filesystem. Provides agents with a sandboxed `bash` tool whose writes go to an in-memory overlay and do **not** touch the real filesystem unless committed.
+A thin MCP (Model Context Protocol) server that wraps [Vercel Labs' `just-bash`](https://github.com/vercel-labs/just-bash) — a virtual bash environment in TypeScript with an in-memory filesystem. Provides agents with a sandboxed `bash` tool whose writes go to an in-memory overlay and never reach the real filesystem (there is no commit tool). The separate `faf_*` tools are **not** sandboxed: they run real host commands.
 
 ## Tools exposed
 
@@ -13,8 +13,10 @@ A thin MCP (Model Context Protocol) server that wraps [Vercel Labs' `just-bash`]
 | `bash_exec(script, timeout?)` | Run a bash script in the sandbox. Timeout capped at 30s, stdout at 1MB. |
 | `sandbox_status` | Show project root, age, exec count, network policy. |
 | `sandbox_reset(confirm)` | Drop the overlay and start fresh. Requires `confirm: true`. |
-| `realpath(sandboxPath)` | Translate `/home/user/project/*` to the real `<project-root>/*` path. |
-| `path_exists(sandboxPath)` | Check existence in overlay + real FS. |
+| `realpath(sandboxPath)` | Translate `/home/user/project/*` to the real `<project-root>/*` path; rejects paths that resolve outside the root. |
+| `path_exists(sandboxPath)` | Check existence as the sandbox sees it (overlay over project root); same boundary as `realpath`. |
+| `faf_migrate` / `faf_sync` / `faf_moltbot_sync` | **Host commands that write real files** in the given absolute project directory. |
+| `faf_score` | Host command, read-only report. |
 
 ## Path translation
 
@@ -32,13 +34,15 @@ The sandbox mounts the project root at `/home/user/project`. Use `realpath` to t
 | `JUST_BASH_NETWORK_ALLOW` | (disabled) | Comma-separated URL prefixes for `curl` (GET/HEAD only) |
 | `JUST_BASH_MAX_DURATION_MS` | 30000 | Script timeout cap |
 | `JUST_BASH_MAX_OUTPUT_BYTES` | 1048576 | stdout cap |
+| `JUST_BASH_ENABLE_FAF_SYNC` | (unset) | Set to `1` to expose `faf_sync` / `faf_moltbot_sync` (they overwrite agent docs on the host); hidden and refused otherwise |
 
 ## Non-negotiables
 
-- **Writes do NOT touch the real filesystem.** The overlay is in-memory. To commit, the user must do so explicitly outside this MCP server.
+- **`bash_exec` writes do NOT touch the real filesystem.** The overlay is in-memory. To keep a change, the user must apply it explicitly outside this MCP server.
+- **The `faf_*` tools are the exception:** they run `faf` / `faf-moltbot` on the host and can overwrite project files.
 - **Network is OFF by default.** Set `JUST_BASH_NETWORK_ALLOW` to a comma-separated allow-list (e.g. `https://api.github.com/repos/,https://registry.npmjs.org/`) to enable `curl`.
 - **No VM isolation.** This is a TypeScript-level sandbox, not OS-level. It stops accidental damage, not a determined attacker.
-- **Path traversal blocked.** Sandbox paths must start with `/home/user/project`.
+- **Path traversal blocked.** `realpath`/`path_exists` check the *resolved* host path stays inside the project root; `bash_exec` is confined by just-bash `OverlayFs`.
 
 ## When to use this
 
