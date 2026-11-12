@@ -7,7 +7,6 @@ Every agent in your fleet — OpenCode, Codex, Claude, Droid, Cline, Kiro, Gemin
 ## What you get
 
 - 100+ unix commands (`cat`, `awk`, `sed`, `jq`, `sqlite3`, `xan`, `yq`, `tar`, `grep`, `sort`, `find`, `tee`, ...)
-- Optional `python3` (CPython compiled to WASM) and `js-exec` (QuickJS) — opt-in
 - Pipes, redirections, variables, if/while/for, functions, all the bash you know
 - A real bash, not a shell-out to PowerShell — works the same on every OS
 - Path translation: `/home/user/project/*` ↔ your real `<project-root>/*`
@@ -18,7 +17,7 @@ Every agent in your fleet — OpenCode, Codex, Claude, Droid, Cline, Kiro, Gemin
 ## What you don't get (intentional)
 
 - No VM isolation. This is a TypeScript sandbox, not OS-level. It stops accidental damage — a slipped `rm -rf` won't kill your real project — but not a determined attacker.
-- No modification of the real filesystem. The overlay is in-memory; committing is a separate step the user does explicitly.
+- No modification of the real filesystem **from `bash_exec`**. The overlay is in-memory and there is no commit tool. Exception: the `faf_migrate`, `faf_sync` and `faf_moltbot_sync` tools run host commands and do write real project files.
 - No PowerShell compatibility. This is bash. For your day-to-day shell on Windows, keep using PowerShell.
 
 ## Install
@@ -27,6 +26,12 @@ Every agent in your fleet — OpenCode, Codex, Claude, Droid, Cline, Kiro, Gemin
 cd "C:\tools\03-Projects\lains Tools\just-bash-mcp"
 npm install
 npm run build
+```
+
+## Test
+
+```bash
+npm test   # builds, then drives dist/index.js over MCP stdio against a temp fixture
 ```
 
 ## Run standalone (for testing)
@@ -115,6 +120,7 @@ await path_exists({ sandboxPath: "/home/user/project/README.md" });
 | `JUST_BASH_NETWORK_ALLOW` | (empty) | Comma-separated URL prefixes (e.g. `https://api.github.com/,https://registry.npmjs.org/`) |
 | `JUST_BASH_MAX_DURATION_MS` | 30000 | Max script duration |
 | `JUST_BASH_MAX_OUTPUT_BYTES` | 1048576 | Max stdout bytes |
+| `JUST_BASH_ENABLE_FAF_SYNC` | (unset) | Set to `1` to expose `faf_sync` / `faf_moltbot_sync` (they overwrite agent docs on the host); hidden and refused otherwise |
 
 ## Limits
 
@@ -131,9 +137,10 @@ Built into just-bash itself:
 |---|---|
 | **TypeScript sandbox** | Stops prototype-pollution attacks and accidental escape to host JS engine |
 | **Filesystem isolation** | Writes go to in-memory overlay; reads from real FS only at the configured project root |
-| **Path translation** | All sandbox paths must start with `/home/user/project`; traversal blocked |
+| **Path translation** | `realpath`/`path_exists` reject any path whose resolved host path leaves the project root (`..`, `..`, drive letters, sibling prefixes); `path_exists` asks the overlay, not the host |
 | **Network isolation** | Off by default; allow-list with URL prefix + HTTP method (GET/HEAD) |
-| **Optional runtimes off** | `python3` and `js-exec` are opt-in — they don't exist unless you set `python: true` / `javascript: true` |
+| **Optional runtimes off** | `python3` and `js-exec` are not enabled by this server |
+| **Host FAF tools (not sandboxed)** | `faf_*` run real commands in any existing absolute directory; arguments with `" % !` or newlines are refused because cmd.exe cannot pass them safely |
 | **Execution limits** | Prevent infinite loops, runaway computation |
 | **No VM** | If you need a full VM with arbitrary binary execution, use [Vercel Sandbox](https://vercel.com/docs/vercel-sandbox) instead — same API, different backend |
 

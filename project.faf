@@ -41,22 +41,23 @@ domain:
     - "Execution limits: 30s timeout, 1MB output cap, 10k command max"
   capabilities:
     - Full bash + 100+ unix commands (cat, awk, sed, jq, sqlite3, xan, yq, tar, etc.)
-    - Optional python3 (CPython compiled to WASM) - opt-in via bash_exec config
-    - Optional js-exec (QuickJS) - opt-in
+    - python3 / js-exec runtimes exist in just-bash but are NOT enabled by this server
     - "Path translation: /home/user/project/* <-> <project-root>/*"
     - In-memory writes; real FS reads
   security_model:
-    - Writes do NOT touch the real filesystem unless explicitly committed
+    - bash_exec writes stay in an in-memory overlay; there is no commit tool (discarded on reset/restart)
+    - faf_migrate / faf_sync / faf_moltbot_sync run real host commands on any existing absolute directory and DO write the real filesystem; faf_score is read-only
     - No VM isolation - TS-level sandbox, not OS-level
     - Network disabled by default; allow-list via JUST_BASH_NETWORK_ALLOW env var
-    - Python/JS runtimes off by default (use just-bash's opt-in flags)
     - Configurable execution limits prevent runaway scripts
-    - Path traversal blocked - sandbox paths must start with /home/user/project
+    - realpath/path_exists reject any path whose resolved host path leaves the project root (.., backslash, drive letter, sibling prefix); path_exists queries the overlay, never the host directly
+    - faf_* host commands refuse arguments containing " % ! or newlines (cmd.exe cannot pass them safely)
   configuration:
     - "JUST_BASH_PROJECT_ROOT - project dir to mount (default: cwd)"
     - JUST_BASH_NETWORK_ALLOW - comma-separated URL prefixes
     - JUST_BASH_MAX_DURATION_MS - script timeout (default 30000)
     - JUST_BASH_MAX_OUTPUT_BYTES - stdout cap (default 1048576)
+    - JUST_BASH_ENABLE_FAF_SYNC - set to 1 to expose faf_sync/faf_moltbot_sync (off by default)
   conventions:
     - Use bash_exec for all commands; never access real FS directly
     - "Path translation: ask realpath to convert sandbox paths before reading"

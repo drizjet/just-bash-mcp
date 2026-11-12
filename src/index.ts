@@ -5,7 +5,13 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { Bash, OverlayFs } from "just-bash";
-import { resolve as pathResolve, normalize, sep } from "node:path";
+import {
+  resolve as pathResolve,
+  normalize,
+  relative,
+  isAbsolute,
+  posix,
+} from "node:path";
 import { stat } from "node:fs/promises";
 import { spawn } from "node:child_process";
 
@@ -26,6 +32,42 @@ const MAX_OUTPUT_BYTES = Number(
   process.env.JUST_BASH_MAX_OUTPUT_BYTES ?? 1024 * 1024
 );
 
+const SANDBOX_ROOT = "/home/user/project";
+const DEFAULT_TIMEOUT_MS = 10_000;
+
+/**
+ * Translate a sandbox path to a real path that is guaranteed to stay inside
+ * PROJECT_ROOT, or return null.
+ *
+ * The final check runs on the *resolved host path*, not the input string: a
+ * prefix test on the input admits `../`, `..\` (a plain filename to posix but a
+ * separator to win32), drive letters such as `C:/x`, and sibling names such as
+ * `/home/user/project-other`. Symlinks are not followed here; callers that touch
+ * the filesystem must go through OverlayFs, which refuses symlinks by default.
+ */
+function sandboxToReal(sandboxPath: string): string | null {
+  if (sandboxPath.includes("\0")) return null;
+  const norm = posix.normalize(sandboxPath);
+  if (norm !== SANDBOX_ROOT && !norm.startsWith(SANDBOX_ROOT + "/")) return null;
+  const rel = norm.slice(SANDBOX_ROOT.length).replace(/^\/+/, "");
+  const root = pathResolve(PROJECT_ROOT);
+  const real = pathResolve(root, rel);
+  const back = relative(root, real);
+  if (back === "") return real;
+  if (back === ".." || back.startsWith(".." + "/") || back.startsWith("..\\") || isAbsolute(back)) {
+    return null;
+  }
+  return real;
+}
+
+function parseTimeout(raw: unknown): number {
+  // A NaN/negative delay makes Node fire setTimeout after 1ms, aborting almost
+  // every script; fall back to the default instead.
+  const n = Number(raw ?? DEFAULT_TIMEOUT_MS);
+  if (!Number.isFinite(n) || n <= 0) return Math.min(DEFAULT_TIMEOUT_MS, MAX_DURATION_MS);
+  return Math.min(n, MAX_DURATION_MS);
+}
+
 const sandbox = {
   bash: null as Bash | null,
   overlay: null as OverlayFs | null,
@@ -39,7 +81,7 @@ async function getBash(): Promise<Bash> {
   const overlay = new OverlayFs({ root: PROJECT_ROOT });
   const bash = new Bash({
     fs: overlay,
-    cwd: "/home/user/project",
+    cwd: SANDBOX_ROOT,
     executionLimits: {
       maxCallDepth: 100,
       maxCommandCount: 10_000,
@@ -70,22 +112,30 @@ function truncate(s: string, max: number): string {
   );
 }
 
-async function pathExists(p: string): Promise<boolean> {
-  try {
-    await stat(p);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 const FAF_BIN = process.env.FAF_BIN ?? "faf";
 const FAF_MOLTBOT_BIN = process.env.FAF_MOLTBOT_BIN ?? "faf-moltbot";
+
+// faf sync / faf-moltbot sync regenerate agent docs from project.faf and can
+// overwrite hand-maintained instructions (and recreate root CLAUDE/SOUL files
+// some workspaces forbid). Agents only get them when the operator opts in.
+const FAF_SYNC_ENABLED = process.env.JUST_BASH_ENABLE_FAF_SYNC === "1";
+const GATED_TOOLS = new Set(["faf_sync", "faf_moltbot_sync"]);
 
 interface HostCmdResult {
   stdout: string;
   stderr: string;
   exitCode: number;
+}
+
+// cmd.exe expands %VAR% (and !VAR! under delayed expansion) even inside double
+// quotes, and an embedded quote would end the quoted span; refuse those instead
+// of attempting to escape them. Inside quotes, & | < > ^ are literal.
+const CMD_UNSAFE = /["%!\r\n\0]/;
+
+function quoteForCmd(arg: string): string {
+  // Backslashes directly before the closing quote would escape it for the
+  // MSVCRT/Node argv parser of the called program, so double them.
+  return `"${arg.replace(/(\\+)$/, "$1$1")}"`;
 }
 
 function runHostCommand(
@@ -96,11 +146,26 @@ function runHostCommand(
 ): Promise<HostCmdResult> {
   return new Promise((resolve) => {
     const isWin = process.platform === "win32";
+    if (isWin) {
+      const bad = [command, ...args].find((a) => CMD_UNSAFE.test(a));
+      if (bad !== undefined) {
+        resolve({
+          stdout: "",
+          stderr: `refused: argument contains a character cmd.exe cannot pass safely (" % ! or newline): ${bad}`,
+          exitCode: 1,
+        });
+        return;
+      }
+    }
+    // On Windows, faf/faf-moltbot are npm .cmd shims, which Node will only run
+    // through cmd.exe. /s strips exactly the outer quote pair, and verbatim
+    // arguments stop Node from re-escaping the already-quoted line.
     const child = isWin
-      ? spawn("cmd.exe", ["/d", "/s", "/c", [command, ...args].map((a) => (a.includes(" ") ? `"${a}"` : a)).join(" ")], {
+      ? spawn("cmd.exe", ["/d", "/s", "/c", `"${[command, ...args].map(quoteForCmd).join(" ")}"`], {
           cwd,
           stdio: ["ignore", "pipe", "pipe"],
           windowsHide: true,
+          windowsVerbatimArguments: true,
         })
       : spawn(command, args, {
           cwd,
@@ -144,9 +209,45 @@ function runHostCommand(
   });
 }
 
-function resolveFafProject(arg: unknown): string {
-  const p = typeof arg === "string" && arg.length > 0 ? arg : PROJECT_ROOT;
-  return normalize(p);
+/**
+ * Validate the `project` argument of the faf_* tools. These tools run real host
+ * commands; scope is intentionally NOT limited to PROJECT_ROOT (that is a
+ * trust-model decision for the operator), but the target must be an existing
+ * absolute directory so a relative or mistyped path cannot silently resolve
+ * against the server's cwd.
+ */
+async function resolveFafProject(
+  arg: unknown
+): Promise<{ project: string } | { error: string }> {
+  const raw = typeof arg === "string" && arg.length > 0 ? arg : PROJECT_ROOT;
+  if (!isAbsolute(raw)) return { error: `project must be an absolute path (got: ${raw})` };
+  const project = pathResolve(raw);
+  try {
+    if (!(await stat(project)).isDirectory()) {
+      return { error: `project is not a directory: ${project}` };
+    }
+  } catch {
+    return { error: `project directory does not exist: ${project}` };
+  }
+  return { project };
+}
+
+async function runFafTool(
+  label: string,
+  bin: string,
+  args: (project: string) => string[],
+  projectArg: unknown
+) {
+  const resolved = await resolveFafProject(projectArg);
+  if ("error" in resolved) {
+    return {
+      content: [{ type: "text" as const, text: `Error: ${resolved.error}` }],
+      isError: true,
+    };
+  }
+  const { project } = resolved;
+  const result = await runHostCommand(bin, args(project), project, 30_000);
+  return formatFafResult(label, project, result);
 }
 
 function formatFafResult(
@@ -181,163 +282,179 @@ const server = new Server(
 );
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
-    {
-      name: "bash_exec",
-      description:
-        "Execute a bash script in a sandboxed virtual filesystem mounted at the project root. " +
-        "Writes go to an in-memory overlay and do NOT touch the real filesystem unless committed. " +
-        "Network is disabled unless JUST_BASH_NETWORK_ALLOW is set. " +
-        "Supports: cat/cp/ls/find/grep/awk/sed/sort/uniq/jq/sqlite3/xan/yq/tar/tee, " +
-        "optional python3 (CPython WASM) and js-exec (QuickJS) runtimes.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          script: {
-            type: "string",
-            description: "Bash script to execute",
-          },
-          timeout: {
-            type: "number",
-            description: `Timeout in ms (max ${MAX_DURATION_MS})`,
-            default: 10_000,
-          },
-        },
-        required: ["script"],
-      },
-    },
-    {
-      name: "sandbox_status",
-      description:
-        "Show the current sandbox state: project root, age, exec count, last script, network policy.",
-      inputSchema: {
-        type: "object",
-        properties: {},
-      },
-    },
-    {
-      name: "sandbox_reset",
-      description:
-        "Discard the current sandbox (drops all in-memory writes) and create a fresh one. " +
-        "Use this when you want to start over from the real project state.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          confirm: {
-            type: "boolean",
-            description: "Must be true to confirm destruction of in-memory writes",
-            default: false,
-          },
-        },
-        required: ["confirm"],
-      },
-    },
-    {
-      name: "realpath",
-      description:
-        "Resolve a sandbox path to its real filesystem path (for reading or committing).",
-      inputSchema: {
-        type: "object",
-        properties: {
-          sandboxPath: {
-            type: "string",
-            description: "Path inside the sandbox, e.g. /home/user/project/src/foo.ts",
-          },
-        },
-        required: ["sandboxPath"],
-      },
-    },
-    {
-      name: "path_exists",
-      description: "Check if a path exists in the sandbox (overlay + real fs).",
-      inputSchema: {
-        type: "object",
-        properties: {
-          sandboxPath: {
-            type: "string",
-            description: "Path inside the sandbox",
-          },
-        },
-        required: ["sandboxPath"],
-      },
-    },
-    {
-      name: "faf_migrate",
-      description:
-        "Run `faf migrate` on a project directory to upgrade project.faf to the latest schema version. " +
-        "Operates on the REAL filesystem (bypasses the bash sandbox). Modifies project.faf in place.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          project: {
-            type: "string",
-            description:
-              "Absolute path to project directory (defaults to JUST_BASH_PROJECT_ROOT)",
-          },
-        },
-      },
-    },
-    {
-      name: "faf_sync",
-      description:
-        "Run `faf sync` on a project directory to regenerate CLAUDE.md and other agent docs from project.faf. " +
-        "Operates on the REAL filesystem. May overwrite faf-generated AGENTS.md (use a custom AGENTS.md to keep your own).",
-      inputSchema: {
-        type: "object",
-        properties: {
-          project: {
-            type: "string",
-            description:
-              "Absolute path to project directory (defaults to JUST_BASH_PROJECT_ROOT)",
-          },
-        },
-      },
-    },
-    {
-      name: "faf_score",
-      description:
-        "Run `faf score` on a project directory to get a quality report (slot fill %, color). " +
-        "Read-only. Operates on the REAL filesystem.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          project: {
-            type: "string",
-            description:
-              "Absolute path to project directory (defaults to JUST_BASH_PROJECT_ROOT)",
-          },
-        },
-      },
-    },
-    {
-      name: "faf_moltbot_sync",
-      description:
-        "Run `faf-moltbot sync` on a project directory to generate SOUL.md with persona + constraints inline. " +
-        "Operates on the REAL filesystem. Overwrites SOUL.md in the project root.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          project: {
-            type: "string",
-            description:
-              "Absolute path to project directory (defaults to JUST_BASH_PROJECT_ROOT)",
-          },
-        },
-      },
-    },
-  ],
+  tools: TOOLS.filter((t) => FAF_SYNC_ENABLED || !GATED_TOOLS.has(t.name)),
 }));
+
+const TOOLS = [
+  {
+    name: "bash_exec",
+    description:
+      "Execute a bash script in a virtual filesystem whose project root is mounted read-through at /home/user/project. " +
+      "Writes go to an in-memory overlay that is never written to disk (there is no commit tool; " +
+      "it is discarded on sandbox_reset or server restart). Paths outside the mount cannot reach the host. " +
+      "Network is disabled unless JUST_BASH_NETWORK_ALLOW is set. " +
+      "Supports: cat/cp/ls/find/grep/awk/sed/sort/uniq/jq/sqlite3/xan/yq/tar/tee. " +
+      "The python3 and js-exec runtimes are not enabled in this server. " +
+      "Note: the faf_* tools in this server are NOT sandboxed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        script: {
+          type: "string",
+          description: "Bash script to execute",
+        },
+        timeout: {
+          type: "number",
+          description: `Timeout in ms (max ${MAX_DURATION_MS})`,
+          default: 10_000,
+        },
+      },
+      required: ["script"],
+    },
+  },
+  {
+    name: "sandbox_status",
+    description:
+      "Show the current sandbox state: project root, age, exec count, last script, network policy.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+    },
+  },
+  {
+    name: "sandbox_reset",
+    description:
+      "Discard the current sandbox (drops all in-memory writes) and create a fresh one. " +
+      "Use this when you want to start over from the real project state.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        confirm: {
+          type: "boolean",
+          description: "Must be true to confirm destruction of in-memory writes",
+          default: false,
+        },
+      },
+      required: ["confirm"],
+    },
+  },
+  {
+    name: "realpath",
+    description:
+      "Translate a path under /home/user/project to the corresponding real path under the project root. " +
+      "Rejects paths that would leave the project root. Does not check existence or follow symlinks.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sandboxPath: {
+          type: "string",
+          description: "Path inside the sandbox, e.g. /home/user/project/src/foo.ts",
+        },
+      },
+      required: ["sandboxPath"],
+    },
+  },
+  {
+    name: "path_exists",
+    description:
+      "Check if a path under /home/user/project exists as the sandbox sees it " +
+      "(in-memory overlay writes and deletions applied over the real project root).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sandboxPath: {
+          type: "string",
+          description: "Path inside the sandbox",
+        },
+      },
+      required: ["sandboxPath"],
+    },
+  },
+  {
+    name: "faf_migrate",
+    description:
+      "Run `faf migrate` on a project directory to upgrade project.faf to the latest schema version. " +
+      "Operates on the REAL filesystem (bypasses the bash sandbox). Modifies project.faf in place.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project: {
+          type: "string",
+          description:
+            "Absolute path to project directory (defaults to JUST_BASH_PROJECT_ROOT)",
+        },
+      },
+    },
+  },
+  {
+    name: "faf_sync",
+    description:
+      "Run `faf sync` on a project directory to regenerate CLAUDE.md and other agent docs from project.faf. " +
+      "Operates on the REAL filesystem. May overwrite faf-generated AGENTS.md (use a custom AGENTS.md to keep your own).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project: {
+          type: "string",
+          description:
+            "Absolute path to project directory (defaults to JUST_BASH_PROJECT_ROOT)",
+        },
+      },
+    },
+  },
+  {
+    name: "faf_score",
+    description:
+      "Run `faf score` on a project directory to get a quality report (slot fill %, color). " +
+      "Read-only. Operates on the REAL filesystem.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project: {
+          type: "string",
+          description:
+            "Absolute path to project directory (defaults to JUST_BASH_PROJECT_ROOT)",
+        },
+      },
+    },
+  },
+  {
+    name: "faf_moltbot_sync",
+    description:
+      "Run `faf-moltbot sync` on a project directory to generate SOUL.md with persona + constraints inline. " +
+      "Operates on the REAL filesystem. Overwrites SOUL.md in the project root.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project: {
+          type: "string",
+          description:
+            "Absolute path to project directory (defaults to JUST_BASH_PROJECT_ROOT)",
+        },
+      },
+    },
+  },
+];
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
+  if (GATED_TOOLS.has(name) && !FAF_SYNC_ENABLED) {
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Error: ${name} is disabled; the operator must set JUST_BASH_ENABLE_FAF_SYNC=1 to allow it`,
+        },
+      ],
+      isError: true,
+    };
+  }
+
   switch (name) {
     case "bash_exec": {
       const script = String((args as { script: string }).script ?? "");
-      const timeout = Math.min(
-        Number((args as { timeout?: number }).timeout ?? 10_000),
-        MAX_DURATION_MS
-      );
+      const timeout = parseTimeout((args as { timeout?: unknown }).timeout);
       if (!script.trim()) {
         return {
           content: [
@@ -391,7 +508,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const lines = [
         `Project root:    ${PROJECT_ROOT}`,
         `Overlay root:    ${overlayRoot}`,
-        `Sandbox cwd:     /home/user/project`,
+        `Sandbox cwd:     ${SANDBOX_ROOT}`,
         `Age:             ${sandbox.bash ? Math.round((Date.now() - sandbox.createdAt) / 1000) + "s" : "n/a"}`,
         `Executions:      ${sandbox.execCount}`,
         `Last script:     ${sandbox.lastScript ?? "(none)"}`,
@@ -434,20 +551,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const sandboxPath = String(
         (args as { sandboxPath: string }).sandboxPath ?? ""
       );
-      const root = "/home/user/project";
-      if (!sandboxPath.startsWith(root)) {
+      const real = sandboxToReal(sandboxPath);
+      if (real === null) {
         return {
           content: [
             {
               type: "text",
-              text: `Error: path must start with ${root} (got: ${sandboxPath})`,
+              text: `Error: path must stay within ${SANDBOX_ROOT} (got: ${sandboxPath})`,
             },
           ],
           isError: true,
         };
       }
-      const rel = sandboxPath.slice(root.length).replace(/^\/+/, "");
-      const real = pathResolve(PROJECT_ROOT, rel);
       return {
         content: [{ type: "text", text: real }],
       };
@@ -457,61 +572,42 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const sandboxPath = String(
         (args as { sandboxPath: string }).sandboxPath ?? ""
       );
-      const root = "/home/user/project";
-      if (!sandboxPath.startsWith(root)) {
+      // Same boundary as realpath, then ask the overlay itself so in-memory
+      // writes/deletions count and OverlayFs's symlink policy applies. Never
+      // stat the host path directly: that made this tool an existence oracle
+      // for arbitrary host files.
+      if (sandboxToReal(sandboxPath) === null) {
         return {
           content: [
-            { type: "text", text: `Error: path must start with ${root}` },
+            { type: "text", text: `Error: path must stay within ${SANDBOX_ROOT}` },
           ],
           isError: true,
         };
       }
-      const rel = sandboxPath.slice(root.length).replace(/^\/+/, "");
-      const real = pathResolve(PROJECT_ROOT, rel);
-      const exists = await pathExists(real);
+      await getBash();
+      const exists = await sandbox.overlay!.exists(posix.normalize(sandboxPath));
       return {
         content: [{ type: "text", text: String(exists) }],
       };
     }
 
-    case "faf_migrate": {
-      const project = resolveFafProject(
-        (args as { project?: string }).project
-      );
-      const result = await runHostCommand(FAF_BIN, ["migrate"], project, 30_000);
-      return formatFafResult("faf migrate", project, result);
-    }
+    case "faf_migrate":
+      return runFafTool("faf migrate", FAF_BIN, () => ["migrate"], (args as { project?: unknown }).project);
 
-    case "faf_sync": {
-      const project = resolveFafProject(
-        (args as { project?: string }).project
-      );
-      const result = await runHostCommand(FAF_BIN, ["sync"], project, 30_000);
-      return formatFafResult("faf sync", project, result);
-    }
+    case "faf_sync":
+      return runFafTool("faf sync", FAF_BIN, () => ["sync"], (args as { project?: unknown }).project);
 
-    case "faf_score": {
-      const project = resolveFafProject(
-        (args as { project?: string }).project
-      );
-      const result = await runHostCommand(FAF_BIN, ["score"], project, 30_000);
-      return formatFafResult("faf score", project, result);
-    }
+    case "faf_score":
+      return runFafTool("faf score", FAF_BIN, () => ["score"], (args as { project?: unknown }).project);
 
-    case "faf_moltbot_sync": {
-      const project = resolveFafProject(
-        (args as { project?: string }).project
-      );
-      const quotedProject =
-        process.platform === "win32" ? `"${project}"` : project;
-      const result = await runHostCommand(
+    case "faf_moltbot_sync":
+      // runHostCommand quotes each argument; pre-quoting here produced ""path"".
+      return runFafTool(
+        "faf-moltbot sync",
         FAF_MOLTBOT_BIN,
-        ["sync", "-w", quotedProject],
-        project,
-        30_000
+        (project) => ["sync", "-w", project],
+        (args as { project?: unknown }).project
       );
-      return formatFafResult("faf-moltbot sync", project, result);
-    }
 
     default:
       return {
